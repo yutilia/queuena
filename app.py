@@ -107,14 +107,13 @@ async def call_novelai_api(request: GenerationRequest):
         "input": request.input,
         "model": request.model,
         "action": request.action,
-        "parameters": request.parameters,
-        "negative_prompt": request.negative_prompt
+        "parameters": request.parameters
     }
     
     async with httpx.AsyncClient(timeout=120.0) as client:
         try:
             response = await client.post(
-                "https://api.novelai.net/ai/generate-image",
+                "https://image.novelai.net/ai/generate-image",
                 headers=headers,
                 json=payload
             )
@@ -161,55 +160,58 @@ async def process_next_task():
     
     try:
         if hasattr(conn, 'execute'):
-            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
-            result = cursor.fetchone()
-            processing_count = result[0] if result else 0
-        else:
-            result = await conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
-            processing_count = result.rows[0][0] if result.rows else 0
-        
-        if processing_count > 0:
-            logger.info("已有任务在处理中，跳过")
-            return
-        
-        if hasattr(conn, 'execute'):
+            conn.execute('''
+                UPDATE tasks 
+                SET status = 'processing', started_at = CURRENT_TIMESTAMP 
+                WHERE id = (
+                    SELECT id FROM tasks 
+                    WHERE status = 'pending' 
+                    ORDER BY created_at ASC 
+                    LIMIT 1
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks WHERE status = 'processing'
+                )
+            ''')
+            conn.commit()
+            
             cursor = conn.execute('''
                 SELECT * FROM tasks 
-                WHERE status = 'pending' 
-                ORDER BY created_at ASC 
+                WHERE status = 'processing'
+                ORDER BY started_at DESC 
                 LIMIT 1
             ''')
             task = cursor.fetchone()
         else:
+            await conn.execute('''
+                UPDATE tasks 
+                SET status = 'processing', started_at = CURRENT_TIMESTAMP 
+                WHERE id = (
+                    SELECT id FROM tasks 
+                    WHERE status = 'pending' 
+                    ORDER BY created_at ASC 
+                    LIMIT 1
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM tasks WHERE status = 'processing'
+                )
+            ''')
+            
             result = await conn.execute('''
                 SELECT * FROM tasks 
-                WHERE status = 'pending' 
-                ORDER BY created_at ASC 
+                WHERE status = 'processing'
+                ORDER BY started_at DESC 
                 LIMIT 1
             ''')
             task = result.rows[0] if result.rows else None
         
         if not task:
-            logger.info("队列为空，无任务可处理")
+            logger.info("队列为空或已有任务在处理中")
             return
         
         task_dict = row_to_dict(task)
         task_id = task_dict['id']
         logger.info(f"开始处理任务: {task_id}")
-        
-        if hasattr(conn, 'execute'):
-            conn.execute('''
-                UPDATE tasks 
-                SET status = 'processing', started_at = CURRENT_TIMESTAMP 
-                WHERE id = ?
-            ''', (task_id,))
-            conn.commit()
-        else:
-            await conn.execute('''
-                UPDATE tasks 
-                SET status = 'processing', started_at = CURRENT_TIMESTAMP 
-                WHERE id = ?
-            ''', (task_id,))
         
         req = GenerationRequest(
             input=task_dict['input'],
