@@ -1,13 +1,11 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import asyncio
 import httpx
 import uuid
-import json
-import time
 import logging
-from collections import OrderedDict
+import sqlite3
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,12 +20,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MAX_QUEUE_SIZE = 100
-MAX_CONCURRENT_TASKS = 5
+DB_PATH = os.environ.get("QUEUE_DB_PATH", "queue.db")
 
-task_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
-tasks = OrderedDict()
-active_tasks = 0
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            input TEXT NOT NULL,
+            model TEXT NOT NULL,
+            action TEXT NOT NULL,
+            parameters TEXT NOT NULL,
+            api_key TEXT NOT NULL,
+            greeting TEXT NOT NULL,
+            negative_prompt TEXT NOT NULL,
+            use_new_shared_trial INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            position INTEGER NOT NULL DEFAULT 0,
+            result TEXT,
+            error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 class GenerationRequest(BaseModel):
     input: str
@@ -38,76 +59,6 @@ class GenerationRequest(BaseModel):
     greeting: str = "正在生成中~"
     negative_prompt: str = ""
     use_new_shared_trial: bool = True
-
-class TaskStatus(BaseModel):
-    taskId: str
-    status: str
-    position: int = 0
-    imageData: str = ""
-    error: str = ""
-
-async def process_tasks():
-    global active_tasks
-    while True:
-        if active_tasks >= MAX_CONCURRENT_TASKS:
-            await asyncio.sleep(0.5)
-            continue
-        
-        try:
-            task_id = await task_queue.get()
-            active_tasks += 1
-            await process_single_task(task_id)
-            active_tasks -= 1
-            task_queue.task_done()
-        except Exception as e:
-            logger.error(f"任务处理循环错误: {e}")
-            await asyncio.sleep(1)
-
-async def process_single_task(task_id):
-    global tasks
-    
-    if task_id not in tasks:
-        return
-    
-    task = tasks[task_id]
-    request = task["request"]
-    
-    try:
-        tasks[task_id]["status"] = "running"
-        logger.info(f"开始处理任务: {task_id}")
-        
-        image_data = await call_novelai_api(request)
-        
-        tasks[task_id]["status"] = "completed"
-        tasks[task_id]["imageData"] = image_data
-        logger.info(f"任务完成: {task_id}")
-        
-        for ws in task.get("websockets", []):
-            try:
-                await ws.send_json({
-                    "success": True,
-                    "id": task_id,
-                    "imageData": image_data,
-                    "prompt": request.input,
-                    "change": request.input
-                })
-            except:
-                pass
-                
-    except Exception as e:
-        tasks[task_id]["status"] = "failed"
-        tasks[task_id]["error"] = str(e)
-        logger.error(f"任务失败: {task_id}, 错误: {e}")
-        
-        for ws in task.get("websockets", []):
-            try:
-                await ws.send_json({
-                    "success": False,
-                    "id": task_id,
-                    "error": str(e)
-                })
-            except:
-                pass
 
 async def call_novelai_api(request: GenerationRequest):
     headers = {
@@ -142,189 +93,276 @@ async def call_novelai_api(request: GenerationRequest):
         else:
             raise ValueError("API 返回不包含图片数据")
 
+async def process_next_task():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    
+    try:
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
+        processing_count = cursor.fetchone()[0]
+        
+        if processing_count > 0:
+            logger.info("已有任务在处理中，跳过")
+            conn.close()
+            return
+        
+        cursor.execute('''
+            SELECT * FROM tasks 
+            WHERE status = 'pending' 
+            ORDER BY created_at ASC 
+            LIMIT 1
+        ''')
+        task = cursor.fetchone()
+        
+        if not task:
+            logger.info("队列为空，无任务可处理")
+            conn.close()
+            return
+        
+        task_id = task['id']
+        logger.info(f"开始处理任务: {task_id}")
+        
+        cursor.execute('''
+            UPDATE tasks 
+            SET status = 'processing', started_at = CURRENT_TIMESTAMP 
+            WHERE id = ?
+        ''', (task_id,))
+        conn.commit()
+        
+        req = GenerationRequest(
+            input=task['input'],
+            model=task['model'],
+            action=task['action'],
+            parameters=eval(task['parameters']),
+            api_key=task['api_key'],
+            greeting=task['greeting'],
+            negative_prompt=task['negative_prompt'],
+            use_new_shared_trial=bool(task['use_new_shared_trial'])
+        )
+        
+        try:
+            image_data = await call_novelai_api(req)
+            
+            cursor.execute('''
+                UPDATE tasks 
+                SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            ''', (image_data, task_id))
+            logger.info(f"任务完成: {task_id}")
+        except Exception as e:
+            cursor.execute('''
+                UPDATE tasks 
+                SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            ''', (str(e), task_id))
+            logger.error(f"任务失败: {task_id}, 错误: {e}")
+        
+        conn.commit()
+        
+        cursor.execute('''
+            UPDATE tasks 
+            SET position = (SELECT COUNT(*) FROM tasks t2 WHERE t2.created_at < tasks.created_at AND t2.status = 'pending') + 1
+            WHERE status = 'pending'
+        ''')
+        conn.commit()
+        
+    finally:
+        conn.close()
+
 @app.get("/ping")
 async def ping():
     return {"status": "alive"}
 
 @app.get("/stats")
 async def stats():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+    pending_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
+    processing_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'")
+    completed_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'failed'")
+    failed_count = cursor.fetchone()[0]
+    
+    conn.close()
+    
     return {
-        "queue_size": task_queue.qsize(),
-        "active_tasks": active_tasks,
-        "total_tasks": len(tasks),
-        "max_queue_size": MAX_QUEUE_SIZE,
-        "max_concurrent_tasks": MAX_CONCURRENT_TASKS
+        "service": "NovelAI Cloud Queue Service",
+        "status": "running",
+        "pending_tasks": pending_count,
+        "processing_tasks": processing_count,
+        "completed_tasks": completed_count,
+        "failed_tasks": failed_count
     }
 
 @app.post("/queue")
 async def submit_task(request: GenerationRequest):
-    if task_queue.full():
-        raise HTTPException(status_code=429, detail="队列已满，请稍后重试")
-    
     task_id = str(uuid.uuid4())[:12]
     
-    tasks[task_id] = {
-        "status": "queued",
-        "request": request,
-        "websockets": [],
-        "imageData": "",
-        "error": ""
-    }
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    await task_queue.put(task_id)
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+    position = cursor.fetchone()[0] + 1
+    
+    cursor.execute('''
+        INSERT INTO tasks 
+        (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    ''', (
+        task_id,
+        request.input,
+        request.model,
+        request.action,
+        str(request.parameters),
+        request.api_key,
+        request.greeting,
+        request.negative_prompt,
+        int(request.use_new_shared_trial),
+        position
+    ))
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"任务入队: {task_id}, 位置: {position}")
+    
+    await process_next_task()
     
     return {
         "taskId": task_id,
-        "status": "queued",
-        "position": task_queue.qsize(),
+        "position": position,
+        "status": "submitted",
         "greeting": request.greeting
     }
 
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
-    if task_id not in tasks:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, status, position, result, error, created_at, started_at, completed_at 
+        FROM tasks 
+        WHERE id = ?
+    ''', (task_id,))
+    
+    task = cursor.fetchone()
+    conn.close()
+    
+    if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     
-    task = tasks[task_id]
+    await process_next_task()
     
-    if task["status"] == "completed":
-        return {
-            "taskId": task_id,
-            "status": "completed",
-            "imageData": task["imageData"]
-        }
-    elif task["status"] == "failed":
-        return {
-            "taskId": task_id,
-            "status": "failed",
-            "error": task["error"]
-        }
+    response = {
+        "taskId": task['id'],
+        "status": task['status'],
+        "position": task['position']
+    }
+    
+    if task['status'] == 'completed':
+        response["completed"] = True
+        response["result"] = {"imageBase64": task['result']}
+        response["imageData"] = task['result']
+    elif task['status'] == 'failed':
+        response["failed"] = True
+        response["error"] = task['error']
+    elif task['status'] == 'processing':
+        response["completed"] = False
+    
+    return response
+
+@app.post("/cancel/{task_id}")
+async def cancel_task(task_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE tasks 
+        SET status = 'cancelled' 
+        WHERE id = ? AND status = 'pending'
+    ''', (task_id,))
+    
+    affected = cursor.rowcount
+    conn.commit()
+    
+    cursor.execute('''
+        UPDATE tasks 
+        SET position = (SELECT COUNT(*) FROM tasks t2 WHERE t2.created_at < tasks.created_at AND t2.status = 'pending') + 1
+        WHERE status = 'pending'
+    ''')
+    conn.commit()
+    conn.close()
+    
+    if affected > 0:
+        return {"success": True, "message": "任务已取消"}
     else:
-        return {
-            "taskId": task_id,
-            "status": task["status"],
-            "position": task_queue.qsize()
-        }
+        return {"success": False, "message": "任务不存在或已在处理中"}
 
 @app.post("/api/predict")
 async def api_predict(request: GenerationRequest):
-    if task_queue.full():
-        raise HTTPException(status_code=429, detail="队列已满")
-    
     task_id = str(uuid.uuid4())[:12]
     
-    tasks[task_id] = {
-        "status": "queued",
-        "request": request,
-        "websockets": [],
-        "imageData": "",
-        "error": ""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+    position = cursor.fetchone()[0] + 1
+    
+    cursor.execute('''
+        INSERT INTO tasks 
+        (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    ''', (
+        task_id,
+        request.input,
+        request.model,
+        request.action,
+        str(request.parameters),
+        request.api_key,
+        request.greeting,
+        request.negative_prompt,
+        int(request.use_new_shared_trial),
+        position
+    ))
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"任务入队 (/api/predict): {task_id}, 位置: {position}")
+    
+    await process_next_task()
+    
+    return {
+        "success": True,
+        "id": task_id,
+        "position": position,
+        "status": "submitted",
+        "prompt": request.input
     }
-    
-    await task_queue.put(task_id)
-    
-    while task_id in tasks:
-        task = tasks[task_id]
-        if task["status"] == "completed":
-            return {
-                "success": True,
-                "id": task_id,
-                "imageData": task["imageData"],
-                "prompt": request.input,
-                "change": request.input
-            }
-        elif task["status"] == "failed":
-            raise HTTPException(status_code=500, detail=task["error"])
-        
-        await asyncio.sleep(0.5)
-    
-    raise HTTPException(status_code=404, detail="任务未找到")
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("WebSocket 连接已建立")
-    
-    task_id = None
-    
-    try:
-        while True:
-            data = await websocket.receive_text()
-            
-            try:
-                request_data = json.loads(data)
-                
-                if task_queue.full():
-                    await websocket.send_json({"success": False, "error": "队列已满"})
-                    continue
-                
-                task_id = str(uuid.uuid4())[:12]
-                
-                request = GenerationRequest(
-                    input=request_data.get("input", ""),
-                    model=request_data.get("model", "nai-diffusion-3"),
-                    action=request_data.get("action", "generate"),
-                    parameters=request_data.get("parameters", {}),
-                    api_key=request_data.get("api_key", ""),
-                    greeting=request_data.get("greeting", "正在生成中~"),
-                    negative_prompt=request_data.get("negative_prompt", ""),
-                    use_new_shared_trial=request_data.get("use_new_shared_trial", True)
-                )
-                
-                tasks[task_id] = {
-                    "status": "queued",
-                    "request": request,
-                    "websockets": [websocket],
-                    "imageData": "",
-                    "error": ""
-                }
-                
-                await task_queue.put(task_id)
-                
-                await websocket.send_json({
-                    "type": "submitted",
-                    "taskId": task_id,
-                    "position": task_queue.qsize(),
-                    "greeting": request.greeting
-                })
-                
-            except json.JSONDecodeError:
-                await websocket.send_json({"success": False, "error": "无效的 JSON 格式"})
-            except Exception as e:
-                await websocket.send_json({"success": False, "error": str(e)})
-                
-    except WebSocketDisconnect:
-        logger.info("WebSocket 连接已断开")
-        if task_id and task_id in tasks:
-            tasks[task_id]["websockets"] = [
-                ws for ws in tasks[task_id]["websockets"] if ws != websocket
-            ]
-    except Exception as e:
-        logger.error(f"WebSocket 错误: {e}")
 
 @app.get("/")
 async def root():
     return {
         "message": "NovelAI Cloud Queue Service",
         "endpoints": {
-            "POST /queue": "提交生成任务",
-            "GET /status/{task_id}": "查询任务状态",
-            "POST /api/predict": "提交任务并等待结果",
+            "POST /queue": "提交生成任务（入队）",
+            "GET /status/{task_id}": "查询任务状态（轮询）",
+            "POST /cancel/{task_id}": "取消任务",
+            "POST /api/predict": "提交任务（兼容 Gradio API）",
             "GET /ping": "健康检查",
-            "GET /stats": "队列统计",
-            "WebSocket /ws": "实时任务推送"
+            "GET /stats": "队列统计"
         }
     }
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(process_tasks())
-    logger.info("队列服务已启动")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("队列服务已关闭")
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
