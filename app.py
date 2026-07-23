@@ -4,7 +4,6 @@ from pydantic import BaseModel
 import httpx
 import uuid
 import logging
-import sqlite3
 import os
 
 logging.basicConfig(level=logging.INFO)
@@ -20,33 +19,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = os.environ.get("QUEUE_DB_PATH", "queue.db")
+TURSO_DB_URL = os.environ.get("TURSO_DB_URL")
+
+def get_db_connection():
+    if TURSO_DB_URL:
+        from libsql_client import Client, ResultSet
+        return Client.from_env()
+    else:
+        import sqlite3
+        conn = sqlite3.connect("queue.db")
+        conn.row_factory = sqlite3.Row
+        return conn
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS tasks (
-            id TEXT PRIMARY KEY,
-            input TEXT NOT NULL,
-            model TEXT NOT NULL,
-            action TEXT NOT NULL,
-            parameters TEXT NOT NULL,
-            api_key TEXT NOT NULL,
-            greeting TEXT NOT NULL,
-            negative_prompt TEXT NOT NULL,
-            use_new_shared_trial INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            position INTEGER NOT NULL DEFAULT 0,
-            result TEXT,
-            error TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            started_at TIMESTAMP,
-            completed_at TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    conn = get_db_connection()
+    
+    try:
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute('''
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    input TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    parameters TEXT NOT NULL,
+                    api_key TEXT NOT NULL,
+                    greeting TEXT NOT NULL,
+                    negative_prompt TEXT NOT NULL,
+                    use_new_shared_trial INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    position INTEGER NOT NULL DEFAULT 0,
+                    result TEXT,
+                    error TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+            ''')
+            conn.commit()
+        else:
+            cursor = conn.execute('''
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    input TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    parameters TEXT NOT NULL,
+                    api_key TEXT NOT NULL,
+                    greeting TEXT NOT NULL,
+                    negative_prompt TEXT NOT NULL,
+                    use_new_shared_trial INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    position INTEGER NOT NULL DEFAULT 0,
+                    result TEXT,
+                    error TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+            ''')
+    finally:
+        if hasattr(conn, 'close'):
+            conn.close()
 
 init_db()
 
@@ -61,9 +95,12 @@ class GenerationRequest(BaseModel):
     use_new_shared_trial: bool = True
 
 async def call_novelai_api(request: GenerationRequest):
+    if not request.api_key or request.api_key.strip() == "":
+        raise ValueError("API key 为空，请在客户端设置有效的 NovelAI API key")
+    
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {request.api_key}"
+        "Authorization": f"Bearer {request.api_key.strip()}"
     }
     
     payload = {
@@ -75,284 +112,442 @@ async def call_novelai_api(request: GenerationRequest):
     }
     
     async with httpx.AsyncClient(timeout=120.0) as client:
-        response = await client.post(
-            "https://api.novelai.net/ai/generate-image",
-            headers=headers,
-            json=payload
-        )
-        
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
-        
-        data = response.json()
-        
-        if "imageBase64" in data:
-            return f"data:image/png;base64,{data['imageBase64']}"
-        elif "images" in data and data["images"]:
-            return f"data:image/png;base64,{data['images'][0]}"
-        else:
-            raise ValueError("API 返回不包含图片数据")
+        try:
+            response = await client.post(
+                "https://api.novelai.net/ai/generate-image",
+                headers=headers,
+                json=payload
+            )
+            
+            if response.status_code == 401:
+                raise ValueError(f"API key 无效或已过期 (HTTP {response.status_code})")
+            elif response.status_code == 403:
+                raise ValueError(f"访问被拒绝，请检查 API key 和账户权限 (HTTP {response.status_code})")
+            elif response.status_code == 429:
+                raise ValueError(f"请求过于频繁，请稍后重试 (HTTP {response.status_code})")
+            elif response.status_code != 200:
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('detail', error_data.get('error', str(error_data)))
+                except:
+                    error_msg = response.text
+                raise ValueError(f"NovelAI API 错误 (HTTP {response.status_code}): {error_msg}")
+            
+            data = response.json()
+            
+            if "imageBase64" in data:
+                return f"data:image/png;base64,{data['imageBase64']}"
+            elif "images" in data and data["images"]:
+                return f"data:image/png;base64,{data['images'][0]}"
+            else:
+                raise ValueError(f"API 返回不包含图片数据: {str(data)[:200]}")
+        except httpx.ConnectError:
+            raise ValueError("无法连接到 NovelAI API，请检查网络连接")
+        except httpx.TimeoutException:
+            raise ValueError("请求超时，请重试")
+        except Exception as e:
+            raise ValueError(f"请求失败: {str(e)}")
+
+def row_to_dict(row):
+    if hasattr(row, 'keys'):
+        return dict(row)
+    elif hasattr(row, '__dict__'):
+        return row.__dict__
+    else:
+        return dict(zip(['id', 'input', 'model', 'action', 'parameters', 'api_key', 'greeting', 'negative_prompt', 'use_new_shared_trial', 'status', 'position', 'result', 'error', 'created_at', 'started_at', 'completed_at'], row))
 
 async def process_next_task():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     
     try:
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
-        processing_count = cursor.fetchone()[0]
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
+            result = cursor.fetchone()
+            processing_count = result[0] if result else 0
+        else:
+            result = await conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
+            processing_count = result.rows[0][0] if result.rows else 0
         
         if processing_count > 0:
             logger.info("已有任务在处理中，跳过")
-            conn.close()
             return
         
-        cursor.execute('''
-            SELECT * FROM tasks 
-            WHERE status = 'pending' 
-            ORDER BY created_at ASC 
-            LIMIT 1
-        ''')
-        task = cursor.fetchone()
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute('''
+                SELECT * FROM tasks 
+                WHERE status = 'pending' 
+                ORDER BY created_at ASC 
+                LIMIT 1
+            ''')
+            task = cursor.fetchone()
+        else:
+            result = await conn.execute('''
+                SELECT * FROM tasks 
+                WHERE status = 'pending' 
+                ORDER BY created_at ASC 
+                LIMIT 1
+            ''')
+            task = result.rows[0] if result.rows else None
         
         if not task:
             logger.info("队列为空，无任务可处理")
-            conn.close()
             return
         
-        task_id = task['id']
+        task_dict = row_to_dict(task)
+        task_id = task_dict['id']
         logger.info(f"开始处理任务: {task_id}")
         
-        cursor.execute('''
-            UPDATE tasks 
-            SET status = 'processing', started_at = CURRENT_TIMESTAMP 
-            WHERE id = ?
-        ''', (task_id,))
-        conn.commit()
+        if hasattr(conn, 'execute'):
+            conn.execute('''
+                UPDATE tasks 
+                SET status = 'processing', started_at = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            ''', (task_id,))
+            conn.commit()
+        else:
+            await conn.execute('''
+                UPDATE tasks 
+                SET status = 'processing', started_at = CURRENT_TIMESTAMP 
+                WHERE id = ?
+            ''', (task_id,))
         
         req = GenerationRequest(
-            input=task['input'],
-            model=task['model'],
-            action=task['action'],
-            parameters=eval(task['parameters']),
-            api_key=task['api_key'],
-            greeting=task['greeting'],
-            negative_prompt=task['negative_prompt'],
-            use_new_shared_trial=bool(task['use_new_shared_trial'])
+            input=task_dict['input'],
+            model=task_dict['model'],
+            action=task_dict['action'],
+            parameters=eval(task_dict['parameters']),
+            api_key=task_dict['api_key'],
+            greeting=task_dict['greeting'],
+            negative_prompt=task_dict['negative_prompt'],
+            use_new_shared_trial=bool(task_dict['use_new_shared_trial'])
         )
         
         try:
             image_data = await call_novelai_api(req)
             
-            cursor.execute('''
-                UPDATE tasks 
-                SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP 
-                WHERE id = ?
-            ''', (image_data, task_id))
+            if hasattr(conn, 'execute'):
+                conn.execute('''
+                    UPDATE tasks 
+                    SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP 
+                    WHERE id = ?
+                ''', (image_data, task_id))
+                conn.commit()
+            else:
+                await conn.execute('''
+                    UPDATE tasks 
+                    SET status = 'completed', result = ?, completed_at = CURRENT_TIMESTAMP 
+                    WHERE id = ?
+                ''', (image_data, task_id))
+            
             logger.info(f"任务完成: {task_id}")
         except Exception as e:
-            cursor.execute('''
-                UPDATE tasks 
-                SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP 
-                WHERE id = ?
-            ''', (str(e), task_id))
+            if hasattr(conn, 'execute'):
+                conn.execute('''
+                    UPDATE tasks 
+                    SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP 
+                    WHERE id = ?
+                ''', (str(e), task_id))
+                conn.commit()
+            else:
+                await conn.execute('''
+                    UPDATE tasks 
+                    SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP 
+                    WHERE id = ?
+                ''', (str(e), task_id))
+            
             logger.error(f"任务失败: {task_id}, 错误: {e}")
         
-        conn.commit()
-        
-        cursor.execute('''
-            UPDATE tasks 
-            SET position = (SELECT COUNT(*) FROM tasks t2 WHERE t2.created_at < tasks.created_at AND t2.status = 'pending') + 1
-            WHERE status = 'pending'
-        ''')
-        conn.commit()
+        if hasattr(conn, 'execute'):
+            conn.execute('''
+                UPDATE tasks 
+                SET position = (SELECT COUNT(*) FROM tasks t2 WHERE t2.created_at < tasks.created_at AND t2.status = 'pending') + 1
+                WHERE status = 'pending'
+            ''')
+            conn.commit()
+        else:
+            await conn.execute('''
+                UPDATE tasks 
+                SET position = (SELECT COUNT(*) FROM tasks t2 WHERE t2.created_at < tasks.created_at AND t2.status = 'pending') + 1
+                WHERE status = 'pending'
+            ''')
         
     finally:
-        conn.close()
+        if hasattr(conn, 'close'):
+            conn.close()
 
 @app.get("/ping")
 async def ping():
-    return {"status": "alive"}
+    return {"status": "alive", "db_type": "turso" if TURSO_DB_URL else "sqlite"}
 
 @app.get("/stats")
 async def stats():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    conn = get_db_connection()
     
-    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
-    pending_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
-    processing_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'")
-    completed_count = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'failed'")
-    failed_count = cursor.fetchone()[0]
-    
-    conn.close()
-    
-    return {
-        "service": "NovelAI Cloud Queue Service",
-        "status": "running",
-        "pending_tasks": pending_count,
-        "processing_tasks": processing_count,
-        "completed_tasks": completed_count,
-        "failed_tasks": failed_count
-    }
+    try:
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+            pending_count = cursor.fetchone()[0]
+            
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
+            processing_count = cursor.fetchone()[0]
+            
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'")
+            completed_count = cursor.fetchone()[0]
+            
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'failed'")
+            failed_count = cursor.fetchone()[0]
+        else:
+            result = await conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+            pending_count = result.rows[0][0]
+            
+            result = await conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'processing'")
+            processing_count = result.rows[0][0]
+            
+            result = await conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'completed'")
+            completed_count = result.rows[0][0]
+            
+            result = await conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'failed'")
+            failed_count = result.rows[0][0]
+        
+        return {
+            "service": "NovelAI Cloud Queue Service",
+            "status": "running",
+            "db_type": "turso" if TURSO_DB_URL else "sqlite",
+            "pending_tasks": pending_count,
+            "processing_tasks": processing_count,
+            "completed_tasks": completed_count,
+            "failed_tasks": failed_count
+        }
+    finally:
+        if hasattr(conn, 'close'):
+            conn.close()
 
 @app.post("/queue")
 async def submit_task(request: GenerationRequest):
     task_id = str(uuid.uuid4())[:12]
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    conn = get_db_connection()
     
-    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
-    position = cursor.fetchone()[0] + 1
-    
-    cursor.execute('''
-        INSERT INTO tasks 
-        (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-    ''', (
-        task_id,
-        request.input,
-        request.model,
-        request.action,
-        str(request.parameters),
-        request.api_key,
-        request.greeting,
-        request.negative_prompt,
-        int(request.use_new_shared_trial),
-        position
-    ))
-    conn.commit()
-    conn.close()
-    
-    logger.info(f"任务入队: {task_id}, 位置: {position}")
-    
-    await process_next_task()
-    
-    return {
-        "taskId": task_id,
-        "position": position,
-        "status": "submitted",
-        "greeting": request.greeting
-    }
+    try:
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+            position = cursor.fetchone()[0] + 1
+            
+            conn.execute('''
+                INSERT INTO tasks 
+                (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ''', (
+                task_id,
+                request.input,
+                request.model,
+                request.action,
+                str(request.parameters),
+                request.api_key,
+                request.greeting,
+                request.negative_prompt,
+                int(request.use_new_shared_trial),
+                position
+            ))
+            conn.commit()
+        else:
+            result = await conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+            position = result.rows[0][0] + 1
+            
+            await conn.execute('''
+                INSERT INTO tasks 
+                (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ''', (
+                task_id,
+                request.input,
+                request.model,
+                request.action,
+                str(request.parameters),
+                request.api_key,
+                request.greeting,
+                request.negative_prompt,
+                int(request.use_new_shared_trial),
+                position
+            ))
+        
+        logger.info(f"任务入队: {task_id}, 位置: {position}")
+        
+        await process_next_task()
+        
+        return {
+            "taskId": task_id,
+            "position": position,
+            "status": "submitted",
+            "greeting": request.greeting
+        }
+    finally:
+        if hasattr(conn, 'close'):
+            conn.close()
 
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = get_db_connection()
     
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, status, position, result, error, created_at, started_at, completed_at 
-        FROM tasks 
-        WHERE id = ?
-    ''', (task_id,))
-    
-    task = cursor.fetchone()
-    conn.close()
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    
-    await process_next_task()
-    
-    response = {
-        "taskId": task['id'],
-        "status": task['status'],
-        "position": task['position']
-    }
-    
-    if task['status'] == 'completed':
-        response["completed"] = True
-        response["result"] = {"imageBase64": task['result']}
-        response["imageData"] = task['result']
-    elif task['status'] == 'failed':
-        response["failed"] = True
-        response["error"] = task['error']
-    elif task['status'] == 'processing':
-        response["completed"] = False
-    
-    return response
+    try:
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute('''
+                SELECT id, status, position, result, error, created_at, started_at, completed_at 
+                FROM tasks 
+                WHERE id = ?
+            ''', (task_id,))
+            
+            task = cursor.fetchone()
+        else:
+            result = await conn.execute('''
+                SELECT id, status, position, result, error, created_at, started_at, completed_at 
+                FROM tasks 
+                WHERE id = ?
+            ''', (task_id,))
+            
+            task = result.rows[0] if result.rows else None
+        
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        
+        await process_next_task()
+        
+        task_dict = row_to_dict(task)
+        
+        response = {
+            "taskId": task_dict['id'],
+            "status": task_dict['status'],
+            "position": task_dict['position']
+        }
+        
+        if task_dict['status'] == 'completed':
+            response["completed"] = True
+            response["result"] = {"imageBase64": task_dict['result']}
+            response["imageData"] = task_dict['result']
+        elif task_dict['status'] == 'failed':
+            response["failed"] = True
+            response["error"] = task_dict['error']
+        elif task_dict['status'] == 'processing':
+            response["completed"] = False
+        
+        return response
+    finally:
+        if hasattr(conn, 'close'):
+            conn.close()
 
 @app.post("/cancel/{task_id}")
 async def cancel_task(task_id: str):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    conn = get_db_connection()
     
-    cursor.execute('''
-        UPDATE tasks 
-        SET status = 'cancelled' 
-        WHERE id = ? AND status = 'pending'
-    ''', (task_id,))
-    
-    affected = cursor.rowcount
-    conn.commit()
-    
-    cursor.execute('''
-        UPDATE tasks 
-        SET position = (SELECT COUNT(*) FROM tasks t2 WHERE t2.created_at < tasks.created_at AND t2.status = 'pending') + 1
-        WHERE status = 'pending'
-    ''')
-    conn.commit()
-    conn.close()
-    
-    if affected > 0:
-        return {"success": True, "message": "任务已取消"}
-    else:
-        return {"success": False, "message": "任务不存在或已在处理中"}
+    try:
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute('''
+                UPDATE tasks 
+                SET status = 'cancelled' 
+                WHERE id = ? AND status = 'pending'
+            ''', (task_id,))
+            
+            affected = cursor.rowcount
+            conn.commit()
+            
+            conn.execute('''
+                UPDATE tasks 
+                SET position = (SELECT COUNT(*) FROM tasks t2 WHERE t2.created_at < tasks.created_at AND t2.status = 'pending') + 1
+                WHERE status = 'pending'
+            ''')
+            conn.commit()
+        else:
+            result = await conn.execute('''
+                UPDATE tasks 
+                SET status = 'cancelled' 
+                WHERE id = ? AND status = 'pending'
+            ''', (task_id,))
+            
+            affected = result.rows_affected
+            
+            await conn.execute('''
+                UPDATE tasks 
+                SET position = (SELECT COUNT(*) FROM tasks t2 WHERE t2.created_at < tasks.created_at AND t2.status = 'pending') + 1
+                WHERE status = 'pending'
+            ''')
+        
+        if affected > 0:
+            return {"success": True, "message": "任务已取消"}
+        else:
+            return {"success": False, "message": "任务不存在或已在处理中"}
+    finally:
+        if hasattr(conn, 'close'):
+            conn.close()
 
 @app.post("/api/predict")
 async def api_predict(request: GenerationRequest):
     task_id = str(uuid.uuid4())[:12]
     
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    conn = get_db_connection()
     
-    cursor.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
-    position = cursor.fetchone()[0] + 1
-    
-    cursor.execute('''
-        INSERT INTO tasks 
-        (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-    ''', (
-        task_id,
-        request.input,
-        request.model,
-        request.action,
-        str(request.parameters),
-        request.api_key,
-        request.greeting,
-        request.negative_prompt,
-        int(request.use_new_shared_trial),
-        position
-    ))
-    conn.commit()
-    conn.close()
-    
-    logger.info(f"任务入队 (/api/predict): {task_id}, 位置: {position}")
-    
-    await process_next_task()
-    
-    return {
-        "success": True,
-        "id": task_id,
-        "position": position,
-        "status": "submitted",
-        "prompt": request.input
-    }
+    try:
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+            position = cursor.fetchone()[0] + 1
+            
+            conn.execute('''
+                INSERT INTO tasks 
+                (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ''', (
+                task_id,
+                request.input,
+                request.model,
+                request.action,
+                str(request.parameters),
+                request.api_key,
+                request.greeting,
+                request.negative_prompt,
+                int(request.use_new_shared_trial),
+                position
+            ))
+            conn.commit()
+        else:
+            result = await conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+            position = result.rows[0][0] + 1
+            
+            await conn.execute('''
+                INSERT INTO tasks 
+                (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ''', (
+                task_id,
+                request.input,
+                request.model,
+                request.action,
+                str(request.parameters),
+                request.api_key,
+                request.greeting,
+                request.negative_prompt,
+                int(request.use_new_shared_trial),
+                position
+            ))
+        
+        logger.info(f"任务入队 (/api/predict): {task_id}, 位置: {position}")
+        
+        await process_next_task()
+        
+        return {
+            "success": True,
+            "id": task_id,
+            "position": position,
+            "status": "submitted",
+            "prompt": request.input
+        }
+    finally:
+        if hasattr(conn, 'close'):
+            conn.close()
 
 @app.get("/")
 async def root():
     return {
         "message": "NovelAI Cloud Queue Service",
+        "db_type": "turso" if TURSO_DB_URL else "sqlite",
         "endpoints": {
             "POST /queue": "提交生成任务（入队）",
             "GET /status/{task_id}": "查询任务状态（轮询）",
