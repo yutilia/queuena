@@ -129,17 +129,45 @@ async def call_novelai_api(request: GenerationRequest):
                     error_data = response.json()
                     error_msg = error_data.get('detail', error_data.get('error', str(error_data)))
                 except:
-                    error_msg = response.text
+                    try:
+                        error_msg = response.text
+                    except:
+                        error_msg = str(response.content[:500])
                 raise ValueError(f"NovelAI API 错误 (HTTP {response.status_code}): {error_msg}")
             
-            data = response.json()
+            content_type = response.headers.get('content-type', '')
             
-            if "imageBase64" in data:
-                return f"data:image/png;base64,{data['imageBase64']}"
-            elif "images" in data and data["images"]:
-                return f"data:image/png;base64,{data['images'][0]}"
+            if 'json' in content_type.lower():
+                try:
+                    data = response.json()
+                    if "imageBase64" in data:
+                        return f"data:image/png;base64,{data['imageBase64']}"
+                    elif "images" in data and data["images"]:
+                        return f"data:image/png;base64,{data['images'][0]}"
+                    else:
+                        raise ValueError(f"API 返回不包含图片数据: {str(data)[:200]}")
+                except Exception as e:
+                    raise ValueError(f"解析 JSON 响应失败: {str(e)}")
+            
+            elif 'zip' in content_type.lower() or response.content[:4] == b'PK\x03\x04':
+                import base64
+                zip_base64 = base64.b64encode(response.content).decode('ascii')
+                return f"data:application/zip;base64,{zip_base64}"
+            
+            elif 'image' in content_type.lower():
+                import base64
+                img_base64 = base64.b64encode(response.content).decode('ascii')
+                return f"data:{content_type};base64,{img_base64}"
+            
             else:
-                raise ValueError(f"API 返回不包含图片数据: {str(data)[:200]}")
+                try:
+                    text = response.text
+                    if text.strip():
+                        raise ValueError(f"API 返回未知格式: {text[:200]}")
+                except:
+                    pass
+                raise ValueError(f"API 返回未知内容类型: {content_type}")
+                
         except httpx.ConnectError:
             raise ValueError("无法连接到 NovelAI API，请检查网络连接")
         except httpx.TimeoutException:
