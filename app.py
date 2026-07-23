@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
@@ -665,45 +665,55 @@ async def handle_generic_request(body: dict):
             conn.close()
 
 @app.post("/api/generate")
-async def api_generate(request: dict):
-    return await handle_generic_request(request)
+async def api_generate(request: Request):
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.post("/generate")
-async def generate(request: dict):
-    return await handle_generic_request(request)
+async def generate(request: Request):
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.post("/v1/generate")
-async def v1_generate(request: dict):
-    return await handle_generic_request(request)
+async def v1_generate(request: Request):
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.post("/submit")
-async def submit(request: dict):
-    return await handle_generic_request(request)
+async def submit(request: Request):
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.post("/task")
-async def task(request: dict):
-    return await handle_generic_request(request)
+async def task(request: Request):
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.post("/api/queue")
-async def api_queue(request: dict):
-    return await handle_generic_request(request)
+async def api_queue(request: Request):
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.post("/v1/queue")
-async def v1_queue(request: dict):
-    return await handle_generic_request(request)
+async def v1_queue(request: Request):
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.post("/ai/generate-image")
-async def ai_generate_image(request: dict):
-    return await handle_generic_request(request)
+async def ai_generate_image(request: Request):
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.post("/join-queue")
-async def join_queue(request: dict):
-    return await handle_generic_request(request)
+async def join_queue(request: Request):
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.post("/{path:path}")
-async def catch_all_post(path: str, request: dict):
+async def catch_all_post(path: str, request: Request):
     logger.info(f"捕获到未知路径 POST /{path}")
-    return await handle_generic_request(request)
+    body = await request.json()
+    return await handle_generic_request(body)
 
 @app.get("/")
 async def root():
