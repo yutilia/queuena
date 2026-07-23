@@ -1,0 +1,12 @@
+run = "uvicorn app:app --host 0.0.0.0 --port 8000"
+entrypoint = "app.py"
+
+[env]
+TURSO_DB_URL = ""
+
+[deploy]
+  [deploy.environment]
+    TURSO_DB_URL = "${{ secrets.TURSO_DB_URL }}"
+
+[nix]
+channel = "stable-23_11"
