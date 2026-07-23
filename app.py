@@ -700,6 +700,11 @@ async def ai_generate_image(request: dict):
 async def join_queue(request: dict):
     return await handle_generic_request(request)
 
+@app.post("/{path:path}")
+async def catch_all_post(path: str, request: dict):
+    logger.info(f"捕获到未知路径 POST /{path}")
+    return await handle_generic_request(request)
+
 @app.get("/")
 async def root():
     return {
