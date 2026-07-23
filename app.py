@@ -591,6 +591,111 @@ async def api_predict(request: GenerationRequest):
         if hasattr(conn, 'close'):
             conn.close()
 
+async def handle_generic_request(body: dict):
+    task_id = str(uuid.uuid4())[:12]
+    
+    input_text = body.get('input', body.get('prompt', body.get('text', '')))
+    model = body.get('model', body.get('model_name', 'nai-diffusion-3'))
+    action = body.get('action', 'generate')
+    parameters = body.get('parameters', body.get('params', {}))
+    api_key = body.get('api_key', body.get('apiKey', body.get('token', body.get('key', ''))))
+    greeting = body.get('greeting', body.get('message', '正在生成中~'))
+    negative_prompt = body.get('negative_prompt', body.get('negativePrompt', body.get('negative', '')))
+    use_new_shared_trial = body.get('use_new_shared_trial', True)
+    
+    conn = get_db_connection()
+    
+    try:
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+            position = cursor.fetchone()[0] + 1
+            
+            conn.execute('''
+                INSERT INTO tasks 
+                (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ''', (
+                task_id, input_text, model, action, str(parameters), api_key, 
+                greeting, negative_prompt, int(use_new_shared_trial), position
+            ))
+            conn.commit()
+        else:
+            result = await conn.execute("SELECT COUNT(*) FROM tasks WHERE status = 'pending'")
+            position = result.rows[0][0] + 1
+            
+            await conn.execute('''
+                INSERT INTO tasks 
+                (id, input, model, action, parameters, api_key, greeting, negative_prompt, use_new_shared_trial, status, position)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ''', (
+                task_id, input_text, model, action, str(parameters), api_key, 
+                greeting, negative_prompt, int(use_new_shared_trial), position
+            ))
+        
+        logger.info(f"任务入队 (通用端点): {task_id}, 位置: {position}")
+        
+        await process_next_task()
+        
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute('SELECT status, result FROM tasks WHERE id = ?', (task_id,))
+            task = cursor.fetchone()
+        else:
+            result = await conn.execute('SELECT status, result FROM tasks WHERE id = ?', (task_id,))
+            task = result.rows[0] if result.rows else None
+        
+        if task and task[0] == 'completed':
+            return {
+                "success": True,
+                "taskId": task_id,
+                "position": position,
+                "status": "completed",
+                "completed": True,
+                "result": {"imageBase64": task[1]},
+                "imageData": task[1]
+            }
+        
+        return {
+            "success": True,
+            "taskId": task_id,
+            "position": position,
+            "status": "submitted"
+        }
+    finally:
+        if hasattr(conn, 'close'):
+            conn.close()
+
+@app.post("/api/generate")
+async def api_generate(request: dict):
+    return await handle_generic_request(request)
+
+@app.post("/generate")
+async def generate(request: dict):
+    return await handle_generic_request(request)
+
+@app.post("/v1/generate")
+async def v1_generate(request: dict):
+    return await handle_generic_request(request)
+
+@app.post("/submit")
+async def submit(request: dict):
+    return await handle_generic_request(request)
+
+@app.post("/task")
+async def task(request: dict):
+    return await handle_generic_request(request)
+
+@app.post("/api/queue")
+async def api_queue(request: dict):
+    return await handle_generic_request(request)
+
+@app.post("/v1/queue")
+async def v1_queue(request: dict):
+    return await handle_generic_request(request)
+
+@app.post("/ai/generate-image")
+async def ai_generate_image(request: dict):
+    return await handle_generic_request(request)
+
 @app.get("/")
 async def root():
     return {
@@ -598,9 +703,17 @@ async def root():
         "db_type": "turso" if TURSO_DB_URL else "sqlite",
         "endpoints": {
             "POST /queue": "提交生成任务（入队）",
+            "POST /api/queue": "提交任务（兼容通用API）",
+            "POST /v1/queue": "提交任务（兼容通用API）",
+            "POST /api/generate": "提交任务（兼容通用API）",
+            "POST /generate": "提交任务（兼容通用API）",
+            "POST /v1/generate": "提交任务（兼容通用API）",
+            "POST /submit": "提交任务（兼容通用API）",
+            "POST /task": "提交任务（兼容通用API）",
+            "POST /ai/generate-image": "提交任务（兼容 NovelAI 原生API格式）",
+            "POST /api/predict": "提交任务（兼容 Gradio API）",
             "GET /status/{task_id}": "查询任务状态（轮询）",
             "POST /cancel/{task_id}": "取消任务",
-            "POST /api/predict": "提交任务（兼容 Gradio API）",
             "GET /ping": "健康检查",
             "GET /stats": "队列统计"
         }
