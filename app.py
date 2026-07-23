@@ -403,8 +403,25 @@ async def submit_task(request: GenerationRequest):
         
         logger.info(f"任务入队: {task_id}, 位置: {position}")
         
-        import asyncio
-        asyncio.create_task(process_next_task())
+        await process_next_task()
+        
+        if hasattr(conn, 'execute'):
+            cursor = conn.execute('SELECT status, result FROM tasks WHERE id = ?', (task_id,))
+            task = cursor.fetchone()
+        else:
+            result = await conn.execute('SELECT status, result FROM tasks WHERE id = ?', (task_id,))
+            task = result.rows[0] if result.rows else None
+        
+        if task and task[0] == 'completed':
+            return {
+                "taskId": task_id,
+                "position": position,
+                "status": "completed",
+                "completed": True,
+                "result": {"imageBase64": task[1]},
+                "imageData": task[1],
+                "greeting": request.greeting
+            }
         
         return {
             "taskId": task_id,
