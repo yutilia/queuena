@@ -403,7 +403,8 @@ async def submit_task(request: GenerationRequest):
         
         logger.info(f"任务入队: {task_id}, 位置: {position}")
         
-        await process_next_task()
+        import asyncio
+        asyncio.create_task(process_next_task())
         
         return {
             "taskId": task_id,
