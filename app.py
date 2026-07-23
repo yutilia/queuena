@@ -22,14 +22,10 @@ app.add_middleware(
 TURSO_DB_URL = os.environ.get("TURSO_DB_URL")
 
 def get_db_connection():
-    if TURSO_DB_URL:
-        from libsql_client import Client, ResultSet
-        return Client.from_env()
-    else:
-        import sqlite3
-        conn = sqlite3.connect("queue.db")
-        conn.row_factory = sqlite3.Row
-        return conn
+    import sqlite3
+    conn = sqlite3.connect("queue.db")
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
     conn = get_db_connection()
@@ -706,12 +702,6 @@ async def ai_generate_image(request: Request):
 
 @app.post("/join-queue")
 async def join_queue(request: Request):
-    body = await request.json()
-    return await handle_generic_request(body)
-
-@app.post("/{path:path}")
-async def catch_all_post(path: str, request: Request):
-    logger.info(f"捕获到未知路径 POST /{path}")
     body = await request.json()
     return await handle_generic_request(body)
 
