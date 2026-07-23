@@ -696,6 +696,10 @@ async def v1_queue(request: dict):
 async def ai_generate_image(request: dict):
     return await handle_generic_request(request)
 
+@app.post("/join-queue")
+async def join_queue(request: dict):
+    return await handle_generic_request(request)
+
 @app.get("/")
 async def root():
     return {
@@ -711,6 +715,7 @@ async def root():
             "POST /submit": "提交任务（兼容通用API）",
             "POST /task": "提交任务（兼容通用API）",
             "POST /ai/generate-image": "提交任务（兼容 NovelAI 原生API格式）",
+            "POST /join-queue": "提交任务（兼容酒馆智绘姬插件）",
             "POST /api/predict": "提交任务（兼容 Gradio API）",
             "GET /status/{task_id}": "查询任务状态（轮询）",
             "POST /cancel/{task_id}": "取消任务",
